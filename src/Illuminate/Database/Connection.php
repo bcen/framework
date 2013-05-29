@@ -3,6 +3,7 @@
 use PDO;
 use Closure;
 use DateTime;
+use Illuminate\Cache\CacheManager;
 use Illuminate\Database\Query\Processors\Processor;
 
 class Connection implements ConnectionInterface {
@@ -48,6 +49,13 @@ class Connection implements ConnectionInterface {
 	 * @var \Illuminate\Pagination\Paginator
 	 */
 	protected $paginator;
+
+	/**
+	 * The cache manager instance.
+	 *
+	 * @var \Illuminate\Cache\CacheManger
+	 */
+	protected $cache;
 
 	/**
 	 * The default fetch mode of the connection.
@@ -122,7 +130,7 @@ class Connection implements ConnectionInterface {
 
 		// We need to initialize a query grammar and the query post processors
 		// which are both very important parts of the database abstractions
-		// so will initialize them to their default value to get started.
+		// so we initialize these to their default values while starting.
 		$this->useDefaultQueryGrammar();
 
 		$this->useDefaultPostProcessor();
@@ -491,7 +499,7 @@ class Connection implements ConnectionInterface {
 
 		$message = $e->getMessage()." (SQL: {$query}) (Bindings: {$bindings})";
 
-		throw new \Exception($message, 0);	
+		throw new \Exception($message);
 	}
 
 	/**
@@ -506,7 +514,7 @@ class Connection implements ConnectionInterface {
 	{
 		if (isset($this->events))
 		{
-			$this->events->fire('illuminate.query', array($query, $bindings, $time));
+			$this->events->fire('illuminate.query', array($query, $bindings, $time, $this->getName()));
 		}
 
 		if ( ! $this->loggingQueries) return;
@@ -718,12 +726,38 @@ class Connection implements ConnectionInterface {
 	/**
 	 * Set the pagination environment instance.
 	 *
-	 * @param  \Illuminate\Pagination\Environment|Closure  $paginator
+	 * @param  \Illuminate\Pagination\Environment|\Closure  $paginator
 	 * @return void
 	 */
 	public function setPaginator($paginator)
 	{
 		$this->paginator = $paginator;
+	}
+
+	/**
+	 * Get the cache manager instance.
+	 *
+	 * @return \Illuminate\Cache\CacheManager
+	 */
+	public function getCacheManager()
+	{
+		if ($this->cache instanceof Closure)
+		{
+			$this->cache = call_user_func($this->cache);
+		}
+
+		return $this->cache;
+	}
+
+	/**
+	 * Set the cache manager instance on the connection.
+	 *
+	 * @param  \Illuminate\Cache\CacheManager|\Closure  $cache
+	 * @return void
+	 */
+	public function setCacheManager($cache)
+	{
+		$this->cache = $cache;
 	}
 
 	/**

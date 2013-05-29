@@ -37,7 +37,7 @@ class Artisan {
 	 *
 	 * @param  string  $command
 	 * @param  array   $parameters
-	 * @param  Symfony\Component\Console\Output\OutputInterface  $output
+	 * @param  \Symfony\Component\Console\Output\OutputInterface  $output
 	 * @return void
 	 */
 	public function call($command, array $parameters = array(), OutputInterface $output = null)
@@ -79,7 +79,7 @@ class Artisan {
 	 */
 	public function __call($method, $parameters)
 	{
-		return call_user_func_array(array($this->getArtisan(), $method), $parameters);
+		return call_user_func_array(array($this->app['artisan'], $method), $parameters);
 	}
 
 }

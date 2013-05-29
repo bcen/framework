@@ -114,6 +114,27 @@ class Builder {
 	public $offset;
 
 	/**
+	 * The query union statements.
+	 *
+	 * @var array
+	 */
+	public $unions;
+
+	/**
+	 * The key that should be used when caching the query.
+	 *
+	 * @var string
+	 */
+	protected $cacheKey;
+
+	/**
+	 * The number of minutes to cache the query.
+	 *
+	 * @var int
+	 */
+	protected $cacheMinutes;
+
+	/**
 	 * All of the available clause operators.
 	 *
 	 * @var array
@@ -400,9 +421,12 @@ class Builder {
 		// Once we have let the Closure do its things, we can gather the bindings on
 		// the nested query builder and merge them into these bindings since they
 		// need to get extracted out of the children and assigned to the array.
-		$this->wheres[] = compact('type', 'query', 'boolean');
+		if (count($query->wheres))
+		{
+			$this->wheres[] = compact('type', 'query', 'boolean');
 
-		$this->mergeBindings($query);
+			$this->mergeBindings($query);
+		}
 
 		return $this;
 	}
@@ -641,6 +665,7 @@ class Builder {
 	 *
 	 * @param  string  $method
 	 * @param  string  $parameters
+	 * @return \Illuminate\Database\Query\Builder
 	 */
 	public function dynamicWhere($method, $parameters)
 	{
@@ -814,6 +839,36 @@ class Builder {
 	}
 
 	/**
+	 * Add a union statement to the query.
+	 *
+	 * @param  \Illuminate\Database\Query\Builder|\Closure  $query
+	 * @param  bool $all
+	 * @return \Illuminate\Database\Query\Builder
+	 */
+	public function union($query, $all = false)
+	{
+		if ($query instanceof Closure)
+		{
+			call_user_func($query, $query = $this->newQuery());
+		}
+		
+		$this->unions[] = compact('query', 'all');
+
+		return $this->mergeBindings($query);
+	}
+
+	/**
+	 * Add a union all statement to the query.
+	 *
+	 * @param  \Illuminate\Database\Query\Builder|\Closure  $query
+	 * @return \Illuminate\Database\Query\Builder
+	 */
+	public function unionAll($query)
+	{
+		return $this->union($query, true);
+	}
+
+	/**
 	 * Get the SQL representation of the query.
 	 *
 	 * @return string
@@ -821,6 +876,20 @@ class Builder {
 	public function toSql()
 	{
 		return $this->grammar->compileSelect($this);
+	}
+
+	/**
+	 * Indicate that the query results should be cached.
+	 *
+	 * @param  int  $minutes
+	 * @param  string  $key
+	 * @return \Illuminate\Database\Query\Builder
+	 */
+	public function remember($minutes, $key = null)
+	{
+		list($this->cacheMinutes, $this->cacheKey) = array($minutes, $key);
+
+		return $this;
 	}
 
 	/**
@@ -869,19 +938,97 @@ class Builder {
 	 */
 	public function get($columns = array('*'))
 	{
-		// If no columns have been specified for the select statement, we will set them
-		// here to either the passed columns, or the standard default of retrieving
-		// all of the columns on the table using the "wildcard" column character.
-		if (is_null($this->columns))
-		{
-			$this->columns = $columns;
-		}
+		if ( ! is_null($this->cacheMinutes)) return $this->getCached($columns);
 
-		$results = $this->connection->select($this->toSql(), $this->bindings);
+		return $this->getFresh($columns);
+	}
 
-		$this->processor->processSelect($this, $results);
+	/**
+	 * Execute the query as a fresh "select" statement.
+	 *
+	 * @param  array  $columns
+	 * @return array
+	 */
+	public function getFresh($columns = array('*'))
+	{
+		if (is_null($this->columns)) $this->columns = $columns;
 
-		return $results;
+		return $this->processor->processSelect($this, $this->runSelect());
+	}
+
+	/**
+	 * Run the query as a "select" statement against the connection.
+	 *
+	 * @return array
+	 */
+	protected function runSelect()
+	{
+		return $this->connection->select($this->toSql(), $this->bindings);
+	}
+
+	/**
+	 * Execute the query as a cached "select" statement.
+	 *
+	 * @param  array  $columns
+	 * @return array
+	 */
+	public function getCached($columns = array('*'))
+	{
+		list($key, $minutes) = $this->getCacheInfo();
+
+		// If the query is requested ot be cached, we will cache it using a unique key
+		// for this database connection and query statement, including the bindings
+		// that are used on this query, providing great convenience when caching.
+		$cache = $this->connection->getCacheManager();
+
+		$callback = $this->getCacheCallback($columns);
+
+		return $cache->remember($key, $minutes, $callback);
+	}
+
+	/**
+	 * Get the cache key and cache minutes as an array.
+	 *
+	 * @return array
+	 */
+	protected function getCacheInfo()
+	{
+		return array($this->getCacheKey(), $this->cacheMinutes);
+	}
+
+	/**
+	 * Get a unique cache key for the complete query.
+	 *
+	 * @return string
+	 */
+	public function getCacheKey()
+	{
+		return $this->cacheKey ?: $this->generateCacheKey();
+	}
+
+	/**
+	 * Generate the unique cache key for the query.
+	 *
+	 * @return string
+	 */
+	public function generateCacheKey()
+	{
+		$name = $this->connection->getName();
+
+		return md5($name.$this->toSql().serialize($this->bindings));
+	}
+
+	/**
+	 * Get the Closure callback used when caching queries.
+	 *
+	 * @param  array  $columns
+	 * @return \Closure
+	 */
+	protected function getCacheCallback($columns)
+	{
+		$me = $this;
+
+		return function() use ($me, $columns) { return $me->getFresh($columns); };
 	}
 
 	/**
@@ -893,14 +1040,14 @@ class Builder {
 	 */
 	public function lists($column, $key = null)
 	{
-		$columns = is_null($key) ? array($column) : array($column, $key);
+		$columns = $this->getListSelect($column, $key);
 
 		// First we will just get all of the column values for the record result set
 		// then we can associate those values with the column if it was specified
 		// otherwise we can just give these values back without a specific key.
 		$results = new Collection($this->get($columns));
 
-		$values = $results->fetch($column)->all();
+		$values = $results->fetch($columns[0])->all();
 
 		// If a key was specified and we have results, we will go ahead and combine
 		// the values with the keys of all of the records so that the values can
@@ -913,6 +1060,28 @@ class Builder {
 		}
 
 		return $values;
+	}
+
+	/**
+	 * Get the columns that should be used in a list array.
+	 *
+	 * @param  string  $column
+	 * @param  string  $key
+	 * @return array
+	 */
+	protected function getListSelect($column, $key)
+	{
+		$select = is_null($key) ? array($column) : array($column, $key);
+
+		// If the selected column contains a "dot", we will remove it so that the list
+		// operation can run normally. Specifying the table is not needed, since we
+		// really want the names of the columns as it is in this resulting array.
+		if (($dot = strpos($select[0], '.')) !== false)
+		{
+			$select[0] = substr($select[0], $dot + 1);
+		}
+
+		return $select;
 	}
 
 	/**
@@ -1095,9 +1264,12 @@ class Builder {
 		// the aggregate value getting in the way when the grammar builds it.
 		$this->aggregate = null;
 
-		$result = (array) $results[0];
+		if (isset($results[0]))
+		{
+			$result = (array) $results[0];
 
-		return $result['aggregate'];
+			return $result['aggregate'];
+		}
 	}
 
 	/**
@@ -1172,13 +1344,16 @@ class Builder {
 	 *
 	 * @param  string  $column
 	 * @param  int     $amount
+	 * @param  array   $extra
 	 * @return int
 	 */
-	public function increment($column, $amount = 1)
+	public function increment($column, $amount = 1, array $extra = array())
 	{
 		$wrapped = $this->grammar->wrap($column);
 
-		return $this->update(array($column => $this->raw("$wrapped + $amount")));
+		$columns = array_merge(array($column => $this->raw("$wrapped + $amount")), $extra);
+
+		return $this->update($columns);
 	}
 
 	/**
@@ -1186,13 +1361,16 @@ class Builder {
 	 *
 	 * @param  string  $column
 	 * @param  int     $amount
+	 * @param  array   $extra
 	 * @return int
 	 */
-	public function decrement($column, $amount = 1)
+	public function decrement($column, $amount = 1, array $extra = array())
 	{
 		$wrapped = $this->grammar->wrap($column);
 
-		return $this->update(array($column => $this->raw("$wrapped - $amount")));
+		$columns = array_merge(array($column => $this->raw("$wrapped - $amount")), $extra);
+
+		return $this->update($columns);
 	}
 
 	/**
@@ -1314,11 +1492,13 @@ class Builder {
 	 * Merge an array of bindings into our bindings.
 	 *
 	 * @param  \Illuminate\Database\Query\Builder  $query
-	 * @return void
+	 * @return \Illuminate\Database\Query\Builder
 	 */
 	public function mergeBindings(Builder $query)
 	{
 		$this->bindings = array_values(array_merge($this->bindings, $query->bindings));
+
+		return $this;
 	}
 
 	/**
